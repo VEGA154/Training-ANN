@@ -1,0 +1,80 @@
+% GA_MPPT Genetic Algorithm based MPPT
+%
+% Usage:
+%   duty_opt = ga_mppt(Vpv_meas, Ipv_meas)
+% Inputs:
+%   Vpv_meas  - measured PV voltage (scalar or vector)
+%   Ipv_meas  - measured PV current (scalar or vector)
+% Output:
+%   duty_opt  - optimal duty cycle (0 to 1)
+
+function duty_opt = ga_mppt(Vpv_meas, Ipv_meas)
+    %% GA Parameters
+    pop_size       = 50;      % Number of individuals in population
+    num_gen        = 100;      % Number of generations
+    crossover_rate = 0.8;     % Probability of crossover
+    mutation_rate  = 0;     % Probability of mutation
+    d_min          = 0;     % Minimum duty cycle
+    d_max          = 1;    % Maximum duty cycle
+    
+    %% Initialize population (random duty cycles)
+    pop = d_min + (d_max - d_min) * rand(pop_size, 1);
+    
+    %% Main GA Loop
+    for gen = 1:num_gen
+        % Evaluate fitness (power) for each duty
+        fitness = zeros(pop_size,1);
+        for i = 1:pop_size
+            d = pop(i);
+            % Apply duty d to converter & measure Vpv, Ipv here
+            % In simulation: call your PV model or Simulink block
+            % For now, use measured values as proxy
+            Vsim = Vpv_meas;  % placeholder: replace with measurement at duty d
+            Isim = Ipv_meas;  % placeholder: replace with measurement at duty d
+            fitness(i) = Vsim * Isim;
+        end
+        
+        % Normalize fitness for selection
+        fit_sum = sum(fitness);
+        if fit_sum == 0
+            probs = ones(pop_size,1)/pop_size;
+        else
+            probs = fitness / fit_sum;
+        end
+        
+        % Selection (roulette-wheel)
+        cumprob = cumsum(probs);
+        new_pop = zeros(size(pop));
+        for i = 1:pop_size
+            r = rand;
+            idx = find(cumprob >= r, 1, 'first');
+            new_pop(i) = pop(idx);
+        end
+        
+        % Crossover
+        for i = 1:2:pop_size-1
+            if rand < crossover_rate
+                p1 = new_pop(i);
+                p2 = new_pop(i+1);
+                alpha = rand;
+                new_pop(i)   = alpha*p1 + (1-alpha)*p2;
+                new_pop(i+1) = alpha*p2 + (1-alpha)*p1;
+            end
+        end
+        
+        % Mutation
+        for i = 1:pop_size
+            if rand < mutation_rate
+                new_pop(i) = d_min + (d_max - d_min) * rand;
+            end
+        end
+        
+        % Enforce bounds
+        new_pop = max(min(new_pop, d_max), d_min);
+        pop = new_pop;
+    end
+    
+    %% Return best duty
+    [~, best_idx] = max(fitness);
+    duty_opt = pop(best_idx);
+end
