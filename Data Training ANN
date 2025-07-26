@@ -1,0 +1,24 @@
+clear all
+ISCS=7.84;
+IMPS=7.35;
+VOCS=36.3;
+VMPS=29;
+alpha=0.102;
+beta=-0.36099;
+Gs=1000;
+Ts=25;
+for i=1:1000
+    Tmin = 15;
+    Tmax = 45;
+    T = (Tmax-Tmin)*rand + Tmin;
+    Gmin = 0;
+    Gmax = 1000;
+    G = (Gmax-Gmin)*rand + Gmin;
+    IMP(i)=IMPS*(G/Gs)*(1+(alpha*(T-Ts)));
+    VMP(i)=VMPS+(beta*(T-Ts));
+    PMP(i)=VMP(i)*IMP(i);
+    input(i,:)=[G T];
+    output(i,1)=VMP(i);
+    output1(i,1)=IMP(i);
+    output2(i,1)=PMP(i)
+end
