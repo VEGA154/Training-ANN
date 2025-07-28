@@ -1,0 +1,478 @@
+clc; clear; close all;
+try
+    % Coba baca file asli
+    dt = readtable('Drivetest_baru.xlsx');
+    RSRP_real = dt.RSRP;
+    SINR_real = dt.SINR;
+    dist_user = dt.Jarak;
+    azimuth_user = dt.Azimuth;
+    fprintf('✓ File Drivetest_baru.xlsx berhasil dibaca\n');
+catch
+    
+    N_points = 100;
+    dist_user = 200 + rand(N_points, 1) * 1800;        % Jarak 200-2000m
+    azimuth_user = rand(N_points, 1) * 360;            % Azimuth 0-360°
+    
+    % Simulasi RSRP dan SINR berdasarkan jarak
+    RSRP_real = -40 - 20*log10(dist_user/1000) + randn(N_points, 1)*5;  % -40 to -100 dBm
+    SINR_real = 20 - 10*log10(dist_user/1000) + randn(N_points, 1)*3;   % 0 to 20 dB
+    
+    fprintf('✓ Data dummy dibuat: %d titik pengukuran\n', N_points);
+end
+
+============================================
+try
+    horizontalPattern = readmatrix('antenna_horizontal_pattern.csv'); 
+    verticalPattern = readmatrix('antenna_vertical_pattern.csv');
+    fprintf('✓ File antenna pattern berhasil dibaca\n');
+catch
+    fprintf('⚠️  File antenna pattern tidak ditemukan!\n');
+    fprintf('📝 Membuat antenna pattern dummy...\n');
+    
+    % Buat horizontal pattern dummy (typical 3-sector antenna)
+    angles_h = (-180:1:180)';
+    gain_h = zeros(size(angles_h));
+    for i = 1:length(angles_h)
+        if abs(angles_h(i)) <= 65
+            gain_h(i) = -min(12*(angles_h(i)/65)^2, 20);  % 3dB beamwidth ~65°
+        else
+            gain_h(i) = -20;
+        end
+    end
+    horizontalPattern = [angles_h, gain_h];
+    
+    % Buat vertical pattern dummy
+    angles_v = (-90:1:90)';
+    gain_v = zeros(size(angles_v));
+    for i = 1:length(angles_v)
+        if abs(angles_v(i)) <= 10
+            gain_v(i) = -min(12*(angles_v(i)/10)^2, 20);  % 3dB beamwidth ~10°
+        else
+            gain_v(i) = -20;
+        end
+    end
+    verticalPattern = [angles_v, gain_v];
+    
+    fprintf('✓ Antenna pattern dummy dibuat\n');
+end  
+
+initial_azimuth = [100, 170, 315]; 
+initial_tilt    = [3, 3, 0];       
+az_range   = [initial_azimuth - 30; initial_azimuth + 50];
+tilt_range = [0; 8];
+
+h_BS        = 49;  
+TxPower     = 45;   
+freq_MHz    = 1800;  
+G_max       = 17.4;    
+diff_loss   = 2.5;   
+add_loss    = 1.5;    
+
+% ===============================================
+% PARAMETER PSO
+% ===============================================
+pop_size       = 20;        % Jumlah partikel
+max_iter       = 200;       % Maksimum iterasi (safety limit)
+num_vars       = 6;         % Jumlah variabel optimisasi
+lb             = [az_range(1,1), tilt_range(1), az_range(1,2), tilt_range(1), az_range(1,3), tilt_range(1)];
+ub             = [az_range(2,1), tilt_range(2), az_range(2,2), tilt_range(2), az_range(2,3), tilt_range(2)];
+
+% Parameter PSO
+w_max = 0.9;                % Inertia weight maksimum
+w_min = 0.4;                % Inertia weight minimum
+c1 = 2.0;                   % Cognitive coefficient (personal best)
+c2 = 2.0;                   % Social coefficient (global best)
+
+% ===============================================
+% KRITERIA KONVERGENSI YANG LEBIH KOMPREHENSIF
+% ===============================================
+tolerance_fitness = 1e-6;      % Toleransi perubahan fitness
+tolerance_position = 1e-4;     % Toleransi perubahan posisi gbest
+patience = 50;                 % Iterasi tanpa improvement untuk berhenti
+diversity_threshold = 1e-4;    % Threshold diversity partikel
+stagnation_threshold = 1e-8;   % Threshold stagnasi velocity
+convergence_window = 10;       % Window untuk analisis tren konvergensi
+min_iterations = 20;           % Minimum iterasi sebelum bisa konvergen
+
+% Inisialisasi partikel
+position = rand(pop_size, num_vars) .* (ub - lb) + lb;  % Posisi partikel
+velocity = zeros(pop_size, num_vars);                    % Kecepatan partikel
+pbest_position = position;                               % Personal best position
+pbest_fitness = -inf(pop_size, 1);                      % Personal best fitness
+gbest_position = zeros(1, num_vars);                     % Global best position
+gbest_fitness = -inf;                                    % Global best fitness
+
+% Fungsi fitness
+evaluate_fitness = @(sol) ...
+    -0.5 * rmse_rsrp(sol, dist_user, azimuth_user, horizontalPattern, verticalPattern, freq_MHz, TxPower, diff_loss, add_loss, h_BS, G_max, RSRP_real) ...
+    -0.5 * rmse_sinr(sol, dist_user, azimuth_user, horizontalPattern, verticalPattern, freq_MHz, TxPower, diff_loss, add_loss, h_BS, G_max, SINR_real);
+
+% Evaluasi fitness awal dan update personal/global best
+for i = 1:pop_size
+    fitness = evaluate_fitness(position(i,:));
+    pbest_fitness(i) = fitness;
+    
+    if fitness > gbest_fitness
+        gbest_fitness = fitness;
+        gbest_position = position(i,:);
+    end
+end
+
+% ===============================================
+% ALGORITMA PSO DENGAN KRITERIA KONVERGENSI
+% ===============================================
+fitness_history = [];
+position_history = [];
+velocity_magnitude_history = [];
+diversity_history = [];
+
+no_improvement_count = 0;
+best_fitness_prev = -inf;
+gbest_position_prev = gbest_position;  % Inisialisasi dengan nilai awal
+iter = 0;
+converged = false;
+convergence_reason = '';
+convergence_score = 0;  % Score untuk mengukur tingkat konvergensi
+
+fprintf('\n=== MEMULAI OPTIMISASI PSO ===\n');
+fprintf('Kriteria Konvergensi Multi-Level:\n');
+fprintf('  1. Fitness tolerance: %.2e (patience: %d)\n', tolerance_fitness, patience);
+fprintf('  2. Position tolerance: %.2e\n', tolerance_position);
+fprintf('  3. Diversity threshold: %.2e\n', diversity_threshold);
+fprintf('  4. Velocity stagnation: %.2e\n', stagnation_threshold);
+fprintf('  5. Convergence window: %d iterasi\n', convergence_window);
+fprintf('  6. Minimum iterasi: %d\n', min_iterations);
+fprintf('  7. Max iterasi: %d\n\n', max_iter);
+
+while iter < max_iter && ~converged
+    iter = iter + 1;
+    
+    % Update inertia weight (menurun secara linear)
+    w = w_max - (w_max - w_min) * iter / max_iter;
+    
+    % Simpan data sebelumnya untuk analisis
+    velocity_old = velocity;
+    
+    for i = 1:pop_size
+        % Generate random coefficients
+        r1 = rand(1, num_vars);
+        r2 = rand(1, num_vars);
+        
+        % Update velocity
+        velocity(i,:) = w * velocity(i,:) + ...
+                       c1 * r1 .* (pbest_position(i,:) - position(i,:)) + ...
+                       c2 * r2 .* (gbest_position - position(i,:));
+        
+        % Update position
+        position(i,:) = position(i,:) + velocity(i,:);
+        
+        % Apply boundary constraints
+        position(i,:) = max(position(i,:), lb);
+        position(i,:) = min(position(i,:), ub);
+        
+        % Evaluasi fitness partikel
+        fitness = evaluate_fitness(position(i,:));
+        
+        % Update personal best
+        if fitness > pbest_fitness(i)
+            pbest_fitness(i) = fitness;
+            pbest_position(i,:) = position(i,:);
+        end
+        
+        % Update global best
+        if fitness > gbest_fitness
+            gbest_fitness = fitness;
+            gbest_position = position(i,:);
+        end
+    end
+    
+    % Simpan history untuk analisis konvergensi
+    fitness_history(end+1) = gbest_fitness;
+    position_history(end+1,:) = gbest_position;
+    
+    % Hitung metrik konvergensi
+    diversity = mean(var(position, 0, 1));
+    diversity_history(end+1) = diversity;
+    
+    velocity_magnitude = mean(sqrt(sum(velocity.^2, 2)));
+    velocity_magnitude_history(end+1) = velocity_magnitude;
+    
+    % ===============================================
+    % ANALISIS KONVERGENSI MULTI-KRITERIA
+    % ===============================================
+    
+    convergence_score = 0;
+    convergence_details = {};
+    
+    fitness_improvement = 0;  % Inisialisasi
+    position_change = 0;       % Inisialisasi
+    
+    if iter > 1
+        fitness_improvement = gbest_fitness - best_fitness_prev;
+        position_change = norm(gbest_position - gbest_position_prev);
+    end
+    
+    if iter >= min_iterations
+        % 1. KRITERIA FITNESS STAGNATION
+        if abs(fitness_improvement) < tolerance_fitness
+            no_improvement_count = no_improvement_count + 1;
+            if no_improvement_count >= patience
+                convergence_score = convergence_score + 30;
+                convergence_details{end+1} = sprintf('Fitness stagnasi (%d iterasi, Δ=%.2e)', no_improvement_count, fitness_improvement);
+            end
+        else
+            no_improvement_count = 0;
+        end
+        
+        % 2. KRITERIA POSITION CONVERGENCE
+        if position_change < tolerance_position
+            convergence_score = convergence_score + 25;
+            convergence_details{end+1} = sprintf('Posisi gbest konvergen (Δpos=%.2e)', position_change);
+        end
+        
+        % 3. KRITERIA DIVERSITY
+        if diversity < diversity_threshold
+            convergence_score = convergence_score + 20;
+            convergence_details{end+1} = sprintf('Diversity rendah (%.2e)', diversity);
+        end
+        
+        % 4. KRITERIA VELOCITY STAGNATION
+        if velocity_magnitude < stagnation_threshold
+            convergence_score = convergence_score + 15;
+            convergence_details{end+1} = sprintf('Velocity stagnasi (%.2e)', velocity_magnitude);
+        end
+        
+        % 5. KRITERIA TREND ANALYSIS (dalam window tertentu)
+        if length(fitness_history) >= convergence_window
+            recent_fitness = fitness_history(end-convergence_window+1:end);
+            fitness_trend = polyfit(1:convergence_window, recent_fitness, 1);
+            if abs(fitness_trend(1)) < tolerance_fitness/convergence_window
+                convergence_score = convergence_score + 10;
+                convergence_details{end+1} = sprintf('Trend fitness flat (slope=%.2e)', fitness_trend(1));
+            end
+        end
+        
+        % DECISION: Konvergen jika score >= threshold
+        if convergence_score >= 50  % Minimal 2 kriteria utama terpenuhi
+            converged = true;
+            convergence_reason = sprintf('Multi-kriteria terpenuhi (score: %d/100)', convergence_score);
+            for i = 1:length(convergence_details)
+                convergence_reason = [convergence_reason, sprintf('\n    - %s', convergence_details{i})];
+            end
+        end
+    end
+    
+    % Print progress dengan informasi konvergensi yang lebih detail
+    if mod(iter, 5) == 0 || converged
+        fprintf('Iter %3d | Fitness: %8.4f | ΔFit: %.2e | ΔPos: %.2e | Div: %.2e | Vel: %.2e | Score: %d/100\n', ...
+            iter, gbest_fitness, fitness_improvement, ...
+            position_change, diversity, velocity_magnitude, convergence_score);
+    end
+    
+    % Update previous values
+    best_fitness_prev = gbest_fitness;
+    gbest_position_prev = gbest_position;
+end
+
+%% --- Hasil Akhir ---
+fprintf('\n%s\n', repmat('=', 1, 50));
+fprintf('🎯 HASIL OPTIMISASI PSO\n');
+fprintf('%s\n', repmat('=', 1, 50));
+
+solusi = gbest_position;
+fprintf('Solusi Optimal:\n');
+fprintf('  Azimuths : %.2f°, %.2f°, %.2f°\n', solusi(1), solusi(3), solusi(5));
+fprintf('  Tilts    : %.2f°, %.2f°, %.2f°\n', solusi(2), solusi(4), solusi(6));
+fprintf('  Best Fitness: %.4f\n', gbest_fitness);
+
+fprintf('\nStatistik Konvergensi:\n');
+fprintf('  Total iterasi: %d/%d\n', iter, max_iter);
+if converged
+    fprintf('  Status: ✓ KONVERGEN\n');
+    fprintf('  Alasan: %s\n', convergence_reason);
+else
+    fprintf('  Status: ⚠️  TIDAK KONVERGEN (mencapai max iterasi)\n');
+end
+
+% Plot konvergensi yang lebih informatif
+figure('Position', [100, 100, 1400, 800]);
+
+% Subplot 1: Fitness history
+subplot(2,3,1);
+plot(1:length(fitness_history), fitness_history, 'b-', 'LineWidth', 2);
+xlabel('Iterasi');
+ylabel('Best Fitness');
+title('Konvergensi Fitness PSO');
+grid on;
+if converged
+    hold on;
+    plot(iter, gbest_fitness, 'ro', 'MarkerSize', 10, 'MarkerFaceColor', 'r');
+    text(iter, gbest_fitness, sprintf('  Konvergen\n  Iter %d', iter), ...
+         'VerticalAlignment', 'bottom', 'Color', 'red', 'FontWeight', 'bold');
+end
+
+% Subplot 2: Diversity evolution
+subplot(2,3,2);
+plot(1:length(diversity_history), diversity_history, 'g-', 'LineWidth', 2);
+hold on;
+plot([1, length(diversity_history)], [diversity_threshold, diversity_threshold], 'r--', 'LineWidth', 1);
+xlabel('Iterasi');
+ylabel('Diversity');
+title('Diversity Partikel');
+legend('Diversity', 'Threshold', 'Location', 'best');
+grid on;
+
+% Subplot 3: Velocity magnitude
+subplot(2,3,3);
+plot(1:length(velocity_magnitude_history), velocity_magnitude_history, 'c-', 'LineWidth', 2);
+hold on;
+plot([1, length(velocity_magnitude_history)], [stagnation_threshold, stagnation_threshold], 'r--', 'LineWidth', 1);
+xlabel('Iterasi');
+ylabel('Velocity Magnitude');
+title('Kecepatan Partikel');
+legend('Vel Magnitude', 'Stagnation Threshold', 'Location', 'best');
+grid on;
+
+% Subplot 4: Improvement rate
+subplot(2,3,4);
+if length(fitness_history) > 1
+    % Pastikan fitness_history adalah column vector
+    fitness_col = fitness_history(:);
+    improvement_rate = [0; diff(fitness_col)];
+    plot(1:length(improvement_rate), improvement_rate, 'm-', 'LineWidth', 2);
+    hold on;
+    plot([1, length(improvement_rate)], [tolerance_fitness, tolerance_fitness], 'r--', 'LineWidth', 1);
+    plot([1, length(improvement_rate)], [-tolerance_fitness, -tolerance_fitness], 'r--', 'LineWidth', 1);
+    xlabel('Iterasi');
+    ylabel('Fitness Improvement');
+    title('Rate of Improvement');
+    legend('Improvement', '±Tolerance', 'Location', 'best');
+else
+    text(0.5, 0.5, 'Tidak cukup data', 'HorizontalAlignment', 'center');
+    xlabel('Iterasi');
+    ylabel('Fitness Improvement');
+    title('Rate of Improvement');
+end
+grid on;
+
+% Subplot 5: Position convergence
+subplot(2,3,5);
+if size(position_history, 1) > 1
+    position_distances = zeros(size(position_history, 1)-1, 1);
+    for i = 2:size(position_history, 1)
+        position_distances(i-1) = norm(position_history(i,:) - position_history(i-1,:));
+    end
+    semilogy(2:size(position_history, 1), position_distances, 'k-', 'LineWidth', 2);
+    hold on;
+    semilogy([2, size(position_history, 1)], [tolerance_position, tolerance_position], 'r--', 'LineWidth', 1);
+    xlabel('Iterasi');
+    ylabel('Position Change (log scale)');
+    title('Konvergensi Posisi gbest');
+    legend('Position Change', 'Tolerance', 'Location', 'best');
+    grid on;
+end
+
+% Subplot 6: Convergence score evolution
+subplot(2,3,6);
+convergence_scores = zeros(length(fitness_history), 1);
+% Hitung ulang convergence scores untuk plotting (simplified version)
+for i = min_iterations:length(fitness_history)
+    score = 0;
+    if i > 1 && abs(fitness_history(i) - fitness_history(i-1)) < tolerance_fitness
+        score = score + 30;
+    end
+    if i > 1 && length(diversity_history) >= i && diversity_history(i) < diversity_threshold
+        score = score + 20;
+    end
+    convergence_scores(i) = score;
+end
+
+plot(1:length(convergence_scores), convergence_scores, 'r-', 'LineWidth', 2);
+hold on;
+plot([1, length(convergence_scores)], [50, 50], 'g--', 'LineWidth', 1);
+xlabel('Iterasi');
+ylabel('Convergence Score');
+title('Skor Konvergensi Multi-Kriteria');
+legend('Score', 'Threshold (50)', 'Location', 'best');
+grid on;
+
+sgtitle('Analisis Konvergensi Multi-Kriteria PSO', 'FontSize', 14, 'FontWeight', 'bold');
+
+% Tampilkan statistik akhir
+fprintf('\n📊 RINGKASAN PARAMETER PSO:\n');
+fprintf('  Jumlah partikel: %d\n', pop_size);
+fprintf('  Max iterasi: %d\n', max_iter);
+fprintf('  Inertia weight: %.1f → %.1f\n', w_max, w_min);
+fprintf('  Cognitive coef (c1): %.1f\n', c1);
+fprintf('  Social coef (c2): %.1f\n', c2);
+
+fprintf('\n📋 KRITERIA KONVERGENSI:\n');
+fprintf('  Fitness tolerance: %.2e\n', tolerance_fitness);
+fprintf('  Position tolerance: %.2e\n', tolerance_position);
+fprintf('  Patience: %d iterasi\n', patience);
+fprintf('  Diversity threshold: %.2e\n', diversity_threshold);
+fprintf('  Stagnation threshold: %.2e\n', stagnation_threshold);
+
+% Evaluasi kualitas solusi
+fprintf('\n🔍 EVALUASI KUALITAS SOLUSI:\n');
+rsrp_error = rmse_rsrp(solusi, dist_user, azimuth_user, horizontalPattern, verticalPattern, freq_MHz, TxPower, diff_loss, add_loss, h_BS, G_max, RSRP_real);
+sinr_error = rmse_sinr(solusi, dist_user, azimuth_user, horizontalPattern, verticalPattern, freq_MHz, TxPower, diff_loss, add_loss, h_BS, G_max, SINR_real);
+fprintf('  RMSE RSRP: %.4f dBm\n', rsrp_error);
+fprintf('  RMSE SINR: %.4f dB\n', sinr_error);
+fprintf('  Combined fitness: %.4f\n', gbest_fitness);
+
+fprintf('\n⏱️  INFORMASI EKSEKUSI:\n');
+if converged
+    fprintf('  Efisiensi: %.1f%% (konvergen di iterasi %d/%d)\n', 100*iter/max_iter, iter, max_iter);
+    fprintf('  Status: BERHASIL KONVERGEN 🎉\n');
+else
+    fprintf('  Status: BELUM KONVERGEN (butuh lebih banyak iterasi)\n');
+    fprintf('  Saran: Tingkatkan max_iter atau ubah parameter konvergensi\n');
+end
+
+%% --- Fungsi Hitung RMSE (Tidak berubah) ---
+function err = rmse_rsrp(sol, d, az_user, horPat, vertPat, freq, Ptx, Ldiff, Ladd, h_BS, Gmax, RSRP_real)
+N = length(d); RSRP_sim = zeros(N,1);
+for i = 1:N
+    s_best = pilih_sektor(sol, az_user(i));
+    az_bs = sol(2*s_best-1); tilt_bs = sol(2*s_best);
+    d_km = d(i)/1000;
+    PL = 32.45 + 20*log10(freq) + 20*log10(d_km) + Ldiff + Ladd;
+    hor_angle = abs(wrapTo180(az_user(i) - az_bs));
+    hor_gain = interp1(horPat(:,1), horPat(:,2), hor_angle, 'linear', 'extrap');
+    elev_angle = atan2(h_BS, d(i)) * 180/pi;
+    vert_gain = interp1(vertPat(:,1), vertPat(:,2), elev_angle - tilt_bs, 'linear', 'extrap');
+    G_total = Gmax + hor_gain + vert_gain;
+    RSRP_sim(i) = Ptx + G_total - PL;
+end
+err = sqrt(mean((RSRP_real - RSRP_sim).^2));
+end
+
+function err = rmse_sinr(sol, d, az_user, horPat, vertPat, freq, Ptx, Ldiff, Ladd, h_BS, Gmax, SINR_real)
+N = length(d); SINR_sim = zeros(N,1);
+for i = 1:N
+    s_best = pilih_sektor(sol, az_user(i));
+    az_bs = sol(2*s_best-1); tilt_bs = sol(2*s_best);
+    d_km = d(i)/1000;
+    PL = 32.45 + 20*log10(freq) + 20*log10(d_km) + Ldiff + Ladd;
+    hor_angle = abs(wrapTo180(az_user(i) - az_bs));
+    hor_gain = interp1(horPat(:,1), horPat(:,2), hor_angle, 'linear', 'extrap');
+    elev_angle = atan2(h_BS, d(i)) * 180/pi;
+    vert_gain = interp1(vertPat(:,1), vertPat(:,2), elev_angle - tilt_bs, 'linear', 'extrap');
+    G_total = Gmax + hor_gain + vert_gain;
+    RSRP = Ptx + G_total - PL;
+    BW_Hz = 20e6; 
+    noise = -185 + 10*log10(BW_Hz); 
+    SINR_sim(i) = RSRP - noise;
+end
+err = sqrt(mean((SINR_real - SINR_sim).^2));
+end
+
+function s = pilih_sektor(sol, az_user)
+scores = zeros(3, 1);  % Fixed: seharusnya 3 sektor, bukan 2
+for s = 1:3
+    az_bs = sol(2*s - 1);
+    scores(s) = -abs(wrapTo180(az_user - az_bs));
+end
+[~, s] = max(scores);
+end
